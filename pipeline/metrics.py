@@ -27,13 +27,16 @@ class Metrics:
         self.batches_written = 0
         self.queue_depth = 0
         self.last_applied_lsn = 0
-        self.last_commit_ts = None        # commit time of last applied change (ISO str)
+        self.last_read_ts = None          # commit time of last change READ from WAL
+        self.last_written_ts = None       # commit time of last change WRITTEN to Mongo
         self._start = time.monotonic()
 
     # --- mutators (cheap, lock-guarded) ---
-    def on_read(self, n: int = 1):
+    def on_read(self, commit_ts=None, n: int = 1):
         with self._lock:
             self.events_read += n
+            if commit_ts:
+                self.last_read_ts = commit_ts
 
     def on_write(self, n: int, lsn: int, commit_ts):
         with self._lock:
@@ -41,7 +44,7 @@ class Metrics:
             self.batches_written += 1
             self.last_applied_lsn = max(self.last_applied_lsn, lsn)
             if commit_ts:
-                self.last_commit_ts = commit_ts
+                self.last_written_ts = commit_ts
 
     def set_queue_depth(self, depth: int):
         with self._lock:
@@ -49,12 +52,15 @@ class Metrics:
 
     # --- derived signals ---
     def lag_seconds(self) -> float:
+        """Event-time replication lag: how far the last change applied to Mongo trails
+        the last change read from the WAL. Naturally ~0 when caught up/idle (reader and
+        writer converge on the same change), and positive while the writer is behind."""
         with self._lock:
-            ts = self.last_commit_ts
-        if not ts:
+            read_ts, written_ts = self.last_read_ts, self.last_written_ts
+        if not read_ts or not written_ts:
             return 0.0
-        applied = datetime.fromisoformat(ts)
-        return max(0.0, (datetime.now(timezone.utc) - applied).total_seconds())
+        gap = (datetime.fromisoformat(read_ts) - datetime.fromisoformat(written_ts)).total_seconds()
+        return max(0.0, gap)
 
     def lag_bytes(self, pg_conn) -> int:
         """WAL bytes the slot is behind the current write position."""

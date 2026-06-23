@@ -7,6 +7,7 @@ durable LSN back to the slot so the slot only retains un-applied WAL.
 """
 import json
 import logging
+from decimal import Decimal
 
 import psycopg2
 from psycopg2.extras import LogicalReplicationConnection, REPLICATION_LOGICAL
@@ -84,16 +85,28 @@ class Reader:
         self._cur.consume_stream(self._on_message)
 
     def _on_message(self, msg) -> None:
-        change = json.loads(msg.payload)
+        # parse_float=Decimal preserves NUMERIC fidelity: wal2json emits numerics as
+        # unquoted JSON numbers, and plain json.loads would coerce them to float and
+        # drop trailing zeros (e.g. 1419.20 -> 1419.2), breaking field parity.
+        change = json.loads(msg.payload, parse_float=Decimal)
         op = self._build_op(change, msg.data_start)
         if op is not None:
             commit_ts = canonical_timestamp(change["timestamp"]) if change.get("timestamp") else None
             # Blocks here when the queue is full -> natural back-pressure on the WAL.
             self._q.put((op, commit_ts))
-            self._metrics.on_read()
-        # Tell the slot how far the writer has durably persisted.
-        if self._writer.flushed_lsn:
-            msg.cursor.send_feedback(flush_lsn=self._writer.flushed_lsn)
+            self._metrics.on_read(commit_ts)
+        self._confirm(msg)
+
+    def _confirm(self, msg) -> None:
+        """Advance the slot's confirmed_flush_lsn. We confirm up to the writer's durable
+        LSN; additionally, when the queue is fully drained (everything we've read is
+        applied), we confirm up to the end of received WAL — this releases WAL that
+        logical decoding filtered out (other tables/activity), preventing slot bloat."""
+        flush = self._writer.flushed_lsn
+        if self._q.empty():
+            flush = max(flush, msg.wal_end)
+        if flush:
+            msg.cursor.send_feedback(flush_lsn=flush)
 
     def _build_op(self, change: dict, lsn: int):
         table = change.get("table")
