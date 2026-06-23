@@ -1,0 +1,10 @@
+# PostgreSQL 16 with the wal2json logical-decoding output plugin pre-installed.
+# wal2json emits WAL changes as JSON, which is trivial to parse in Python.
+FROM postgres:16
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-16-wal2json \
+    && rm -rf /var/lib/apt/lists/*
+
+# schema.sql runs automatically on first init (empty data dir) via docker-entrypoint.
+COPY sql/schema.sql /docker-entrypoint-initdb.d/10-schema.sql
