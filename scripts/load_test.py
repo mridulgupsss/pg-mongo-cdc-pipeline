@@ -12,13 +12,16 @@ total ops, ops/sec, and error count.
 """
 import argparse
 import random
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 
 import psycopg2.extras
 
-from pipeline.db import pg_connect
+# Allow running as a plain script (python scripts/load_test.py) from the repo root.
+sys.path.insert(0, ".")
+from pipeline.db import pg_connect  # noqa: E402
 
 random.seed(1234)
 STATUSES = ["pending", "paid", "shipped", "delivered", "cancelled"]
@@ -143,8 +146,11 @@ def delete_worker(stop, stats, rate, max_item_id):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    # Rates chosen so total rows/sec land in the spec's targets (5.1): each insert op
+    # creates 1 order + 2-3 items, so insert-rate=1200 orders/s ≈ 4-5k inserted rows/s.
     parser.add_argument("--duration", type=int, default=120)
-    parser.add_argument("--insert-rate", type=int, default=4000)
+    parser.add_argument("--insert-rate", type=int, default=1200,
+                        help="orders/sec; each fans out to ~3 rows across both tables")
     parser.add_argument("--update-rate", type=int, default=1500)
     parser.add_argument("--delete-rate", type=int, default=350)
     args = parser.parse_args()

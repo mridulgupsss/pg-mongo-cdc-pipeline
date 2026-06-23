@@ -165,9 +165,10 @@ def t8_schema_sync(pg, mongo):
 
 
 def t9_lag_bound(pg, mongo):
+    # 2x the spec's normal load: ~8k inserted rows/s + 3k updates + 700 deletes.
     load = subprocess.Popen(
         [sys.executable, "scripts/load_test.py", "--duration", "20",
-         "--insert-rate", "8000", "--update-rate", "3000", "--delete-rate", "700"],
+         "--insert-rate", "2400", "--update-rate", "3000", "--delete-rate", "700"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(5)                          # let load ramp up
     max_lag = 0.0
