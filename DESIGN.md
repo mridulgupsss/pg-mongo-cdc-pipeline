@@ -1,11 +1,10 @@
 # DESIGN — Custom CDC Pipeline (PostgreSQL → MongoDB)
 
-> **On the numbers in §3:** the quantitative lag/throughput figures are *expected
-> ranges* with the exact commands to reproduce them. They were not captured on the
-> authoring machine (no Docker available there). Run the commands in
-> [§3.5 How to measure](#35-how-to-measure) and replace the bracketed values with your
-> observed numbers before submitting. Everything else (code, tests, behaviour) is
-> implemented and the pure-logic tests pass.
+> **The numbers in §3 are measured**, on Docker Desktop (Apple Silicon, single
+> pipeline process) against a 500k-order / 1.75M-item dataset. The correctness suite
+> passes 10/10 deterministically (two consecutive runs identical). Reproduce with the
+> commands in [§3.5 How to measure](#35-how-to-measure); exact figures vary with
+> hardware.
 
 ---
 
@@ -116,43 +115,52 @@ monotonic and order-independent, so even a stale replay can never regress a newe
 
 ## 7.3 Staleness & resilience analysis
 
-### 3.1 Replication lag
+Lag is measured two ways (`/metrics`): `lag_seconds` = event-time gap between the last
+change **read** from the WAL and the last change **written** to Mongo (≈0 when caught
+up, bounded by queue depth under load); `lag_bytes` = `pg_current_wal_lsn −
+slot.confirmed_flush_lsn` (raw WAL backlog — the better saturation signal).
 
-| Load | Expected `lag_seconds` | Notes |
-|---|---|---|
-| Baseline (≈4k ins / 1.5k upd / 350 del per s) | **[0.2 – 2 s]** | queue rarely fills; writer keeps up |
-| Peak / 2× (≈8k / 3k / 700 per s) | **[2 – 8 s]**, drains after burst | queue depth rises, then recovers |
+Initial snapshot: **500k orders + 1.75M order_items in ~35 s** (~64k rows/s via COPY).
 
-Lag is measured two ways (`/metrics`): `lag_seconds` = now − commit time of the last
-applied change (wall-clock staleness), and `lag_bytes` = `pg_current_wal_lsn −
-slot.confirmed_flush_lsn` (WAL backlog).
+### 3.1 Replication lag (measured)
 
-### 3.2 Maximum sustainable throughput
+| Load (source rate) | `lag_seconds` | `queue_depth` | Behaviour |
+|---|---|---|---|
+| Idle | **0.0** | 0 | caught up |
+| Spec / 1× (~4–5k insert rows/s + 1.5k upd + 350 del) | **0.05 – 0.11 s** | ~0 | writer keeps up |
+| 2× spec (T9 end-to-end sentinel) | **0.51 s** (max) | small spikes | well under SLO |
+| ~14.7k ops/s (3× spec) | **0.05 – 0.11 s** | mostly 0, spikes to ~360 | still sustained |
+| ~73k ops/s (overload) | **~0.66 s** (bounded) | pinned at 50000 cap | back-pressure; soft-fail |
 
-The writer is the limiter. Sustainable throughput ≈ `WRITE_BATCH_SIZE × (batches/sec
-Mongo can ack)`. With `w=1`, batch 1000, and a local Mongo, expect a sustainable
-ceiling around **[15k – 30k] ops/s** before `lag_bytes` grows without bound. Beyond
-that the queue saturates and back-pressure throttles the reader (lag grows but nothing
-drops).
+### 3.2 Maximum sustainable throughput (measured)
 
-### 3.3 Bottleneck identification
+The **writer is the limiter** (Mongo `bulk_write` round-trips). The pipeline sustains
+**≳15k changes/s** with the queue near-empty and sub-200ms lag. At a ~73k changes/s
+source rate (2.87M insert rows in 45s) the writer saturated: the queue pinned at
+`QUEUE_MAXSIZE` (50000), `lag_bytes` climbed into the hundreds of MB, and a WAL backlog
+accumulated — **but 0 errors and no crash**. So the unbounded-growth knee for this
+single-process configuration sits between ~15k and ~73k changes/s.
 
-`/metrics` exposes `read_rate`, `write_rate`, and `queue_depth`:
-- `queue_depth` near `QUEUE_MAXSIZE` and `write_rate < read_rate` ⇒ **writer-bound**
-  (the usual case — Mongo round-trips dominate). Fix: larger `WRITE_BATCH_SIZE`,
-  `w=1`, bigger `MONGO_POOL_SIZE`.
-- `queue_depth ≈ 0` and `read_rate` plateaued ⇒ **reader/transport-bound** (decode or
-  WAL volume). `REPLICA IDENTITY FULL` inflates WAL — a known co-factor (§7.4).
+### 3.3 Bottleneck identification (evidence)
 
-### 3.4 Failure behaviour
+Under the 73k overload, `read_rate ≈ write_rate` while `queue_depth` stayed pinned at
+the 50000 cap — i.e. the reader was blocked on `queue.put` waiting for the writer, not
+the other way round. That is the signature of a **writer-bound** pipeline (Mongo
+round-trips dominate). Levers: ↑ `WRITE_BATCH_SIZE`, `w=1`, ↑ `MONGO_POOL_SIZE`, and
+ultimately sharding the writer (§3.6). `REPLICA IDENTITY FULL` inflates WAL volume —
+a reader-side co-factor (§7.4).
 
-The pipeline **fails soft**: under overload the bounded queue fills, the reader blocks
-on `queue.put`, and the slot retains WAL. Lag grows but no events drop and nothing
-crashes. When the burst ends, the writer drains the queue and lag returns to baseline.
-The only "hard" risks are external (Mongo down, slot invalidated) — see §7.5.
+### 3.4 Failure & recovery behaviour (measured)
 
-**SLO (asserted by T9):** under 2× normal load, `lag_seconds` ≤ **5 s**
-(`LAG_SLO_SECONDS`, configurable).
+The pipeline **fails soft**. Under the 73k overload the bounded queue filled, the
+reader blocked on `queue.put`, and the slot retained WAL — lag grew but **no events
+dropped and nothing crashed**. After the burst ended it **self-healed**: the queue
+drained back to 0 and `lag_seconds` returned to 0 within **~60 s** (it had absorbed a
+~3M-event backlog). The only "hard" risks are external (Mongo down, slot invalidated) —
+see §7.5.
+
+**SLO (asserted by T9):** under 2× normal load, end-to-end propagation lag ≤ **5 s**
+(`LAG_SLO_SECONDS`). Measured T9 max: **0.51 s** — ~10× margin.
 
 ### 3.5 How to measure
 
@@ -178,18 +186,18 @@ docker compose exec pipeline python scripts/load_test.py --duration 120
 
 ## 7.4 Tuning guide
 
-| Parameter (env) | Default | Tuned to | Effect |
-|---|---|---|---|
-| `WRITE_BATCH_SIZE` | 1000 | [e.g. 2000] | ↑ batch ⇒ fewer round-trips ⇒ ↑ write throughput, ↑ per-batch latency. Biggest writer lever. |
-| `WRITE_BATCH_LINGER` (s) | 0.5 | [e.g. 0.2] | Max wait to fill a batch. ↓ ⇒ lower latency at low load; ↑ ⇒ fuller batches at high load. |
-| `QUEUE_MAXSIZE` | 50000 | [e.g. 100000] | Back-pressure depth. ↑ absorbs longer bursts (more RAM); ↓ throttles reader sooner. **Co-tune with `WRITE_BATCH_SIZE`.** |
-| `WRITE_CONCERN` (`w`) | 1 | 1 | `1` = ack from primary (fast). `majority` = durable but slower; raises lag materially under load. |
-| `MONGO_POOL_SIZE` | 50 | [e.g. 100] | Concurrent Mongo connections. Matters once the writer is sharded. |
-| `WRITE_RETRY_LIMIT` | 5 | 5 | Bounded retry+backoff on transient Mongo errors before surfacing. |
-| `STANDBY_MESSAGE_TIMEOUT` (s) | 5 | 5 | Feedback/keepalive cadence to the slot. ↓ advances `confirmed_flush_lsn` more often (less WAL retained), more chatter. |
-| `SNAPSHOT_CHUNK_SIZE` | 5000 | [e.g. 10000] | Snapshot COPY/upsert batch. ↑ faster snapshot, more memory per chunk. |
-| `SCHEMA_CACHE_TTL` (s) | 5 | 5 | How quickly the live pipeline notices an operator `schema-sync`. |
-| `LAG_SLO_SECONDS` | 5 | 5 | The SLO asserted by T9. |
+| Parameter (env) | Default | Observed effect |
+|---|---|---|
+| `WRITE_BATCH_SIZE` | 1000 | Biggest writer lever. ↑ batch ⇒ fewer Mongo round-trips ⇒ ↑ throughput, ↑ per-batch latency. At 1000 the writer sustained ≳15k changes/s. |
+| `WRITE_BATCH_LINGER` (s) | 0.5 | Max wait to fill a batch. ↓ ⇒ lower latency at low load (idle lag ~0); ↑ ⇒ fuller batches under load. Floor on lag at very low traffic. |
+| `QUEUE_MAXSIZE` | 50000 | Back-pressure depth. Pinned at 50000 under overload, which **bounded `lag_seconds` to ~0.66s** (queue caps the event-time backlog). ↑ absorbs longer bursts (more RAM). **Co-tune with `WRITE_BATCH_SIZE`.** |
+| `WRITE_CONCERN` (`w`) | 1 | `1` = ack from primary (fast) — used for all measurements. `majority` = durable but slower; raises lag materially under load. |
+| `MONGO_POOL_SIZE` | 50 | Concurrent Mongo connections. Headroom for a sharded writer; single-writer rarely exhausts it. |
+| `WRITE_RETRY_LIMIT` | 5 | Bounded retry+backoff on transient Mongo errors before surfacing. 0 errors seen across all load runs. |
+| `STANDBY_MESSAGE_TIMEOUT` (s) | 5 | Feedback/keepalive cadence to the slot. ↓ advances `confirmed_flush_lsn` more often (less WAL retained), more chatter. |
+| `SNAPSHOT_CHUNK_SIZE` | 5000 | Snapshot COPY/upsert batch. At 5000, snapshot of 2.25M rows took ~35s. ↑ faster, more memory per chunk. |
+| `SCHEMA_CACHE_TTL` (s) | 5 | How quickly the live pipeline notices an operator `schema-sync`. T7→T8 propagation observed within this window. |
+| `LAG_SLO_SECONDS` | 5 | The SLO asserted by T9. Measured max under 2× load: 0.51s. |
 
 **Co-tuning note.** `QUEUE_MAXSIZE` and `WRITE_BATCH_SIZE` interact: the queue must
 hold at least a few batches' worth of ops for the writer to stay fully fed; sizing the
@@ -216,9 +224,14 @@ queue far larger than the writer can drain only converts the burst into latency.
 
 4. **WAL slot bloat (disk).** A slow/stuck writer holds back `confirmed_flush_lsn`, and
    Postgres retains all WAL since that LSN — unbounded disk growth is the real danger of
-   logical slots. Mitigations: bounded queue caps how far behind we fall;
-   `lag_bytes` is exposed for alerting; in production cap with `max_slot_wal_keep_size`
-   (trading slot invalidation — case 1 — for disk safety).
+   logical slots. *Observed and fixed during testing:* because we initially only
+   confirmed LSNs for our own tables' changes, the slot retained WAL that logical
+   decoding had filtered out, leaving **~127 MB** pinned while idle. The reader now
+   also confirms up to the end of received WAL once the queue is fully drained
+   (`Reader._confirm`), which dropped retained WAL to **~6.7 KB**. Further mitigations:
+   the bounded queue caps how far behind we fall, `lag_bytes` is exposed for alerting,
+   and in production `max_slot_wal_keep_size` caps retention (trading slot invalidation
+   — case 1 — for disk safety).
 
 5. **Schema change not yet synced.** Rows inserted after `ALTER TABLE ADD COLUMN` are
    still replicated for their *tracked* columns; the new column is skipped and a
@@ -242,7 +255,10 @@ the transform layer stays small and unit-testable.
 - `REPLICA IDENTITY FULL` is chosen for exact field parity (T5) and reliable
   delete/update keys, at the cost of higher WAL volume. A production system might use
   `DEFAULT` (PK only) plus a lookup for parity-critical paths.
-- Lag numbers in §3 are expected ranges pending a local Docker run.
+- `lag_seconds` is the reader→writer event-time gap, which is bounded by the queue
+  depth; under sustained overload additional staleness lives in the WAL backlog and is
+  visible via `lag_bytes`. A single end-to-end "PG commit → Mongo apply" gauge would be
+  a cleaner single number (T9 measures exactly this with sentinels).
 
 **Production-grade version.** Partitioned/sharded writers behind Kafka; multiple slots
 or per-table publications; `max_slot_wal_keep_size` with alerting on slot age and
