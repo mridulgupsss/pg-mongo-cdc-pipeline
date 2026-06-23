@@ -1,0 +1,19 @@
+# Single image used for the pipeline, the seed script, the load test, and the tests.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# libpq is needed by psycopg2 at runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY pipeline/ ./pipeline/
+COPY scripts/ ./scripts/
+COPY tests/ ./tests/
+COPY sql/ ./sql/
+
+CMD ["python", "-m", "pipeline.main", "run"]

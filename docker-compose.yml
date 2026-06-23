@@ -1,0 +1,66 @@
+# `docker compose up` brings up Postgres (with wal2json + schema), MongoDB, and the
+# pipeline. The pipeline waits for both stores to be healthy, runs the initial
+# snapshot, then switches to streaming. Seeding and load testing are run on demand
+# via `docker compose exec pipeline ...` (see README).
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    environment:
+      POSTGRES_USER: cdc
+      POSTGRES_PASSWORD: cdc
+      POSTGRES_DB: shop
+    # wal_level=logical is mandatory for logical decoding; the slot/sender limits
+    # leave headroom for our single slot.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cdc -d shop"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    environment:
+      PG_DSN: "host=postgres port=5432 dbname=shop user=cdc password=cdc"
+      MONGO_URI: "mongodb://mongo:27017"
+      MONGO_DB: "shop"
+    ports:
+      - "8000:8000"   # plaintext /metrics endpoint (bonus #9)
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  mongodata:
