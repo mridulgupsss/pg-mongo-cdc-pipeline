@@ -34,10 +34,14 @@ def _snapshot_table(pg_conn, mongo_db, table_name: str, pk_col: str,
     with pg_conn.cursor(name=f"snap_{table_name}") as cur:
         cur.itersize = CONFIG.snapshot_chunk_size
         cur.execute(f"SELECT * FROM {table_name}")
-        columns = [d.name for d in cur.description]
 
+        # A named cursor only populates .description after the first fetch, so resolve
+        # column names lazily on the first row.
+        columns = None
         batch = []
         for row in cur:
+            if columns is None:
+                columns = [d.name for d in cur.description]
             values = dict(zip(columns, row))
             doc = build_document(values, types, pk_col, tracked, lsn)
             batch.append(UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True))
