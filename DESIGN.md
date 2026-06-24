@@ -113,6 +113,30 @@ field is set via an aggregation-pipeline `$cond` that only applies when the inco
 LSN exceeds the stored `_lsn` (missing `_lsn` treated as `-1`). This makes writes
 monotonic and order-independent, so even a stale replay can never regress a newer value.
 
+**Write ordering & per-key coalescing.** Writes are *not* applied to Mongo in strict
+WAL order, and deliberately so. The reader enqueues in strict LSN order (single-threaded,
+FIFO queue) and batches are drained sequentially, but *within* a batch the writer issues
+`bulk_write(ordered=False)` so Mongo can apply a collection's operations in parallel — a
+throughput win on the writer, which is the bottleneck (§3.3). Correctness does not depend
+on intra-batch apply order: the LSN guard makes each document converge to its highest-LSN
+value regardless of the order its writes land, so different keys are independent and freely
+reorderable. The one place a *row-level* guard leaks is *field-level* partial updates: if
+the same row is changed twice **within one batch** on **different** columns (e.g. `status`
+at LSN 100 and `total_amount` at LSN 200) and Mongo applies the newer op first, the guard
+would reject the older op wholesale and drop its field. (Across batches this cannot happen —
+they apply in ascending-LSN order, so a lower LSN is never rejected.) To close this without
+giving up the unordered fast path, the writer **coalesces ops per key before writing**
+(`transform.coalesce_ops`): all changes sharing a `(table, primary key)` in a batch are
+merged into a single op that keeps the newest value per field by LSN (order-independent, so
+it does not depend on the batch already being LSN-ordered). The result is at most one write
+per key per batch — nothing for an unordered `bulk_write` to reorder — so **per-key
+sequential consistency** holds while different keys still write in parallel. Coalescing also
+reduces Mongo round-trips when a hot row changes repeatedly inside a linger window.
+Alternatives considered and rejected: `ordered=True` (serialises the batch — penalises the
+bottleneck for no extra correctness) and a per-field `_lsn` (fatter documents, no op
+reduction); per-key coalescing dominates both. Covered by unit tests for disjoint-field
+merge, newest-wins-by-LSN regardless of order, and insert+update completeness.
+
 ## 7.3 Staleness & resilience analysis
 
 Lag is measured two ways (`/metrics`): `lag_seconds` = event-time gap between the last
