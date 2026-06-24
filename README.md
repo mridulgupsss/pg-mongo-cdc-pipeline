@@ -21,11 +21,15 @@ modes.
 
 ## Prerequisites
 
-- Docker + Docker Compose (brings up everything).
-- To run the seed / load / correctness scripts **from the host**, you also need
-  Python 3.11+ with `pip install -r requirements.txt`. They read `PG_DSN` / `MONGO_URI`
-  from the environment and default to `localhost` (the compose file publishes
-  Postgres on `5432` and Mongo on `27017`).
+- Docker + Docker Compose — brings up everything (Postgres, MongoDB, the pipeline)
+  and runs the seed and load scripts *inside* the container, so these need nothing
+  on the host.
+- **Python 3.9+ on the host — only for the test suite** (the T1–T10 correctness run
+  and the `pytest` unit tests; both run from the host because they restart/drive the
+  containers from the outside). Install the deps into a virtualenv with
+  `pip install -r requirements.txt` (see step 4). The host-run tests read `PG_DSN` /
+  `MONGO_URI` from the environment and default to `localhost` (the compose file
+  publishes Postgres on `5432` and Mongo on `27017`).
 
 ## 1. Bring the stack up (single command)
 
@@ -68,10 +72,12 @@ Drives INSERT ≈4000/s, UPDATE ≈1500/s, DELETE ≈350/s and prints a summary
 
 ## 4. Run the correctness suite (T1–T10)
 
-Run **from the host** (T6 restarts the pipeline container, T8/T9 shell out to the
-pipeline CLI and load script):
+Run **from the repo root on the host** (T6 restarts the pipeline container, T8/T9
+shell out to the pipeline CLI and load script). Use a virtualenv so the deps don't
+collide with the system Python (modern macOS/Linux block `pip install` into it):
 
 ```bash
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python tests/run_correctness.py
 ```
