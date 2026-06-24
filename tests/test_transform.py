@@ -4,8 +4,8 @@ Run with: pytest tests/test_transform.py   (or python -m pytest)
 from bson.decimal128 import Decimal128
 
 from pipeline.transform import (
-    build_document, build_pipeline_update, canonical_timestamp, change_to_op,
-    coerce_value, diff_changed,
+    MongoOp, build_document, build_pipeline_update, canonical_timestamp,
+    change_to_op, coalesce_ops, coerce_value, diff_changed,
 )
 
 TRACKED = {"order_id", "customer_email", "total_amount", "status", "is_paid",
@@ -86,6 +86,56 @@ def test_pipeline_update_is_lsn_guarded():
     update = build_pipeline_update({"status": "paid", "_lsn": 5}, lsn=5)
     cond = update[0]["$set"]["status"]["$cond"]
     assert cond[0] == {"$gt": [5, {"$ifNull": ["$_lsn", -1]}]}
+
+
+def test_coalesce_distinct_keys_are_untouched():
+    ops = [MongoOp("orders", 1, {"status": "paid", "_lsn": 1}, lsn=1),
+           MongoOp("orders", 2, {"status": "shipped", "_lsn": 2}, lsn=2)]
+    out = coalesce_ops(ops)
+    assert len(out) == 2
+    assert {o.pk_value for o in out} == {1, 2}
+
+
+def test_coalesce_merges_disjoint_fields_of_same_row():
+    # The bug this fixes: two partial updates to the same row on different fields.
+    # A row-level guard under an unordered bulk write could drop the older field;
+    # after coalescing there is a single op carrying BOTH fields.
+    ops = [MongoOp("orders", 5, {"status": "paid", "_lsn": 100}, lsn=100),
+           MongoOp("orders", 5, {"total_amount": 999, "_lsn": 200}, lsn=200)]
+    out = coalesce_ops(ops)
+    assert len(out) == 1
+    merged = out[0]
+    assert merged.set_fields["status"] == "paid"        # older field preserved
+    assert merged.set_fields["total_amount"] == 999     # newer field present
+    assert merged.set_fields["_lsn"] == 200 and merged.lsn == 200
+
+
+def test_coalesce_same_field_keeps_highest_lsn_regardless_of_order():
+    # Order-independent: the newer value wins even if the older op appears last.
+    ops = [MongoOp("orders", 5, {"status": "shipped", "_lsn": 200}, lsn=200),
+           MongoOp("orders", 5, {"status": "paid", "_lsn": 100}, lsn=100)]
+    out = coalesce_ops(ops)
+    assert len(out) == 1
+    assert out[0].set_fields["status"] == "shipped" and out[0].lsn == 200
+
+
+def test_coalesce_insert_then_update_yields_complete_doc():
+    insert = MongoOp("orders", 5,
+                     {"customer_email": "a@x.com", "status": "pending", "_lsn": 100}, lsn=100)
+    update = MongoOp("orders", 5, {"status": "paid", "_lsn": 200}, lsn=200)
+    out = coalesce_ops([insert, update])
+    assert len(out) == 1
+    fields = out[0].set_fields
+    assert fields["customer_email"] == "a@x.com"   # insert field not lost
+    assert fields["status"] == "paid"              # newer status wins
+    assert fields["_lsn"] == 200
+
+
+def test_coalesce_does_not_merge_across_tables_with_same_pk():
+    ops = [MongoOp("orders", 5, {"_lsn": 1}, lsn=1),
+           MongoOp("order_items", 5, {"_lsn": 2}, lsn=2)]
+    out = coalesce_ops(ops)
+    assert len(out) == 2
 
 
 def test_build_document_matches_insert_shape():

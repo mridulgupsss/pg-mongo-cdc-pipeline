@@ -15,7 +15,7 @@ from pymongo import UpdateOne
 from pymongo.errors import PyMongoError
 
 from pipeline.config import CONFIG
-from pipeline.transform import build_pipeline_update
+from pipeline.transform import build_pipeline_update, coalesce_ops
 
 log = logging.getLogger("cdc.writer")
 
@@ -62,24 +62,31 @@ class Writer(threading.Thread):
 
     # --- writing ---
     def _apply(self, batch) -> None:
-        """Group ops by collection and bulk-write them with bounded retry. Each op is
-        an LSN-guarded conditional upsert, so the batch is order-independent and safe
-        to retry wholesale on failure."""
-        per_table: dict = {}
+        """Coalesce ops per key, then group by collection and bulk-write with bounded
+        retry. Coalescing (transform.coalesce_ops) collapses multiple changes to the
+        same row within this batch into one write, so an unordered bulk write cannot
+        drop a field of a row changed twice in the batch. Each merged op is still an
+        LSN-guarded conditional upsert, so the batch stays order-independent across
+        keys and safe to retry wholesale on failure."""
         max_lsn = 0
         last_commit = None
         for op, commit_ts in batch:
+            max_lsn = max(max_lsn, op.lsn)
+            last_commit = commit_ts or last_commit
+
+        per_table: dict = {}
+        for op in coalesce_ops([op for op, _ in batch]):
             per_table.setdefault(op.table, []).append(
                 UpdateOne({"_id": op.pk_value},
                           build_pipeline_update(op.set_fields, op.lsn),
                           upsert=True))
-            max_lsn = max(max_lsn, op.lsn)
-            last_commit = commit_ts or last_commit
 
         for table, ops in per_table.items():
             self._bulk_write_with_retry(table, ops)
 
         # Durable now -> safe to advance the offset the slot will be told about.
+        # Metrics report the original event count (len(batch)), not the post-coalesce
+        # op count, so events_written stays comparable to events_read.
         self.flushed_lsn = max(self.flushed_lsn, max_lsn)
         self._offset.save(self.flushed_lsn)
         self._metrics.on_write(len(batch), max_lsn, last_commit)

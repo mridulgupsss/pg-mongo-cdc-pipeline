@@ -141,6 +141,42 @@ def change_to_op(change: dict, pk_col: str, tracked: set, lsn: int) -> Optional[
     return None
 
 
+def coalesce_ops(ops: List[MongoOp]) -> List[MongoOp]:
+    """Merge all ops that target the same (table, pk) within one batch into a single
+    op, keeping the newest value per field by LSN.
+
+    Why this exists: the writer issues `bulk_write(ordered=False)`, so Mongo may apply
+    a batch's ops in any order. With a *row-level* LSN guard but *field-level* partial
+    updates, two changes to the same row on different fields in one batch could be
+    applied newest-first, causing the guard to reject (and thus drop) the older field's
+    change. Coalescing guarantees at most one write per key per batch, so there is
+    nothing for Mongo to reorder — within-batch ordering can no longer drop a field.
+
+    Order-independent on purpose: we track the LSN that last set each field and keep
+    the higher one, so correctness does not depend on the batch already being in
+    LSN order (it is today, but this removes that hidden dependency). Bonus: fewer
+    Mongo ops when the same row changes repeatedly in a window."""
+    merged: Dict[Any, MongoOp] = {}
+    field_lsn: Dict[Any, Dict[str, int]] = {}
+    for op in ops:
+        key = (op.table, op.pk_value)
+        cur = merged.get(key)
+        if cur is None:
+            merged[key] = MongoOp(op.table, op.pk_value, dict(op.set_fields),
+                                  lsn=op.lsn, is_delete=op.is_delete)
+            field_lsn[key] = {f: op.lsn for f in op.set_fields}
+            continue
+        fl = field_lsn[key]
+        for field, value in op.set_fields.items():
+            if op.lsn >= fl.get(field, -1):
+                cur.set_fields[field] = value
+                fl[field] = op.lsn
+        if op.lsn >= cur.lsn:
+            cur.is_delete = op.is_delete
+        cur.lsn = max(cur.lsn, op.lsn)
+    return list(merged.values())
+
+
 # ---------------------------------------------------------------------------
 # Mongo update body (LSN-guarded so stale replays never regress a newer value)
 # ---------------------------------------------------------------------------
